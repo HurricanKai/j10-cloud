@@ -20,71 +20,81 @@ Vagrant.configure("2") do |config|
 
     config.vm.synced_folder ".", "/vagrant", disabled: true
 
-    config.vm.define "puppet-master" do |node|
-        node.vm.network "private_network", ip: "192.168.56.2"
-        node.vm.synced_folder "puppet/code/", "/etc/puppetlabs/code"
+    config.vm.define "salt-master" do |node|
+        node.vm.network "private_network", ip: "192.168.57.2"
+        node.vm.synced_folder "salt/master-confs/", "/etc/salt/master.d/"
+        node.vm.synced_folder "salt/minion-confs/", "/etc/salt/minion.d/"
 
-        node.vm.provision :shell, name: "apply hostname", inline: "echo \'puppet-master.local\' > /etc/hostname"
+        # ensure folders are synced before services start
+        node.vm.provision :shell, name: "add vbox workaround", inline: "mkdir -p /etc/systemd/system/salt-minion.service.d/ \
+            && echo \'[Unit]\nConditionDirectoryNotEmpty=/etc/salt/minion.d/\n\' > /etc/systemd/system/salt-minion.service.d/99-ensure-configs.conf"
+        node.vm.provision :shell, name: "add vbox workaround master", inline: "mkdir -p /etc/systemd/system/salt-master.service.d/ \
+            && echo \'[Unit]\nConditionDirectoryNotEmpty=/etc/salt/master.d/\n\' > /etc/systemd/system/salt-master.service.d/99-ensure-configs.conf"
 
-        node.vm.provision :shell, name: "apply host puppet-master", inline: "echo \'192.168.56.2 puppet-master.local\' >> /etc/hosts"
+        node.vm.provision :shell, name: "apply hostname", inline: "echo \'salt-master.local\' > /etc/hostname"
+
+        node.vm.provision :shell, name: "apply host salt-master", inline: "echo \'192.168.57.2 salt-master.local\' >> /etc/hosts"
         (1..NUM_NODES).each do |j|
-            node.vm.provision :shell, name: "apply host node-#{j}", inline: "echo \'192.168.57.#{j + 1} node-#{j}.local\' >> /etc/hosts"
+            node.vm.provision :shell, name: "apply host node-#{j}", inline: "echo \'192.168.57.#{j + 100} node-#{j}.local\' >> /etc/hosts"
         end
         node.vm.provision :shell, name: "reboot for netconf", inline: "echo \"Rebooting to apply network config\"", reboot: true
 
-        # enable puppet repo
-        node.vm.provision :shell, name: "setup puppet package repo",
-            inline: "wget http://apt.puppet.com/puppet8-release-jammy.deb -O puppet.deb --quiet && dpkg -i puppet.deb && rm puppet.deb && apt-get update -q", env: {"DEBIAN_FRONTEND" => "noninteractive"}
+        # enable salt repo
+        node.vm.provision :shell, name: "setup salt key",
+            inline: "curl -fsSL -o /etc/apt/keyrings/salt-archive-keyring-2023.gpg https://repo.saltproject.io/salt/py3/ubuntu/22.04/amd64/SALT-PROJECT-GPG-PUBKEY-2023.gpg \
+            && echo \"deb [signed-by=/etc/apt/keyrings/salt-archive-keyring-2023.gpg arch=amd64] https://repo.saltproject.io/salt/py3/ubuntu/22.04/amd64/latest jammy main\" | sudo tee /etc/apt/sources.list.d/salt.list"
+        node.vm.provision :shell, name: "refresh package list", inline: "apt-get update"
+
+        # install salt packages
+        node.vm.provision :shell, name: "install salt packages", inline: "apt-get install salt-minion salt-master salt-ssh salt-syndic salt-cloud salt-api -o Dpkg::Options::=\"--force-confold\" -q -y"
+
+        node.vm.provision :shell, name: "append to default config for debugging", inline: "echo \'\nlog_level: debug\n\' >> /etc/salt/master"
+
+        node.vm.provision :shell, name: "set local salt config", inline: "echo \'id: salt-master\ngrains:\n  nodeid: salt-master\n\' > /etc/salt/local-minion.conf"
+        node.vm.provision :shell, name: "append to default config for debugging", inline: "echo \'\nlog_level: debug\ninclude: minion.d/*.conf\n\' >> /etc/salt/minion"
+
+        # add auto grains
+        node.vm.provision :shell, name: "create autosign grain dir", inline: "mkdir /etc/salt/autosign_grains"
+        node.vm.provision :shell, name: "enable autosign salt-master", inline: "echo \'salt-master\' >> /etc/salt/autosign_grains/nodeid"
+        (1..NUM_NODES).each do |j|
+            node.vm.provision :shell, name: "enable autosign node-#{j}", inline: "echo \'node-#{j}\' >> /etc/salt/autosign_grains/nodeid"
+        end
         
-        # install puppet server
-        node.vm.provision :shell, name: "install puppet server", inline: "apt-get install puppetserver -o Dpkg::Options::=\"--force-confold\" -q -y", env: {"DEBIAN_FRONTEND" => "noninteractive"}  
-        # enable naive autosigning - NEVER DO THIS IN PROD SEE https://www.puppet.com/docs/puppet/8/ssl_autosign.html
-        node.vm.provision :shell, name: "enable naive autosign", inline: "puppet config set autosign true --section server"
-        node.vm.provision :shell, name: "configure alt-ssl puppet CA",
-            inline: "puppet config set dns_alt_names puppet-master,puppet-master.local,puppetdb,puppetdb.local,puppetboard,puppetboard.local,IP:127.0.0.1"
-        node.vm.provision :shell, name: "enable puppet server", inline: "systemctl enable --now puppetserver"
-
-        # To install any packages, just install into shared folder like:
-        # puppet module install --target-dir ./puppet/code/environments/production/modules/ <module>
-
-        # install puppet agent
-        node.vm.provision :shell, name: "install puppet agent", inline: "apt-get install puppet-agent facter -o Dpkg::Options::=\"--force-confold\" -q -y", env: {"DEBIAN_FRONTEND" => "noninteractive"}
-        node.vm.provision :shell, name: "enable puppet agent", inline: "puppet resource service puppet ensure=running enable=true"   
-        node.vm.provision :shell, name: "set puppet master connection", inline: "puppet config set server puppet-master.local --section main"
-        node.vm.provision :shell, name: "bootstrap puppet ssl", inline: "puppet ssl bootstrap" # nothing further is needed, as autosigning is enabled!
-
-        # install puppetdb
-        node.vm.provision :shell, name: "enable puppetdb", inline: "puppet resource package puppetdb ensure=latest"
-        node.vm.provision :shell, name: "configure puppetdb", inline: "echo \'[main]\nserver_urls = https://puppet-master.local:8081\' > /etc/puppetlabs/puppet/puppetdb.conf"
-        node.vm.provision :shell, name: "configure puppet for puppetdb",
-            inline: "puppet config set storeconfigs true --section server \
-                && puppet config set storeconfigs_backend puppetdb --section server \
-                && puppet config set reports store,puppetdb --section server"
-        node.vm.provision :shell, name: "create routes.yaml", inline: "echo \'---\server:\n  facts:\n     terminus: puppetdb\n    cache: yaml\' > $(puppet config print route_file)"
-        node.vm.provision :shell, name: "restart puppet server", inline: "systemctl restart puppetserver"
+        # start salt
+        node.vm.provision :shell, name: "start salt components", inline: "systemctl enable salt-master && systemctl enable salt-syndic && systemctl enable salt-api && systemctl enable salt-minion", reboot: true
     end
-
 
     (1..NUM_NODES).each do |i|
         config.vm.define "node-#{i}" do |node|
-            node.vm.network "private_network", ip: "192.168.57.#{i + 1}"
+            node.vm.synced_folder "salt/minion-confs/", "/etc/salt/minion.d/"
+            # ensure folders are synced before services start
+            node.vm.provision :shell, name: "add vbox workaround", inline: "mkdir -p /etc/systemd/system/salt-minion.service.d/ \
+                && echo \'[Unit]\nConditionDirectoryNotEmpty=/etc/salt/minion.d/\n\' > /etc/systemd/system/salt-minion.service.d/99-ensure-configs.conf"
+
+            node.vm.network "private_network", ip: "192.168.57.#{i + 100}"
             node.vm.provision :shell, name: "apply hostname", inline: "echo \'node-#{i}.local\' > /etc/hostname"
 
-            node.vm.provision :shell, name: "apply host puppet-master", inline: "echo \'192.168.56.2 puppet-master.local\' >> /etc/hosts"
+            node.vm.provision :shell, name: "apply host salt-master", inline: "echo \'192.168.57.2 salt-master.local\' >> /etc/hosts"
             (1..NUM_NODES).each do |j|
-                node.vm.provision :shell, name: "apply host node-#{j}", inline: "echo \'192.168.57.#{j + 1} node-#{j}.local\' >> /etc/hosts"
+                node.vm.provision :shell, name: "apply host node-#{j}", inline: "echo \'192.168.57.#{j + 100} node-#{j}.local\' >> /etc/hosts"
             end
             node.vm.provision :shell, name: "reboot for netconf", inline: "echo \"Rebooting to apply network config\"", reboot: true
 
-            # enable puppet repo
-            node.vm.provision :shell, name: "setup puppet package repo",
-                inline: "wget http://apt.puppet.com/puppet8-release-jammy.deb -O puppet.deb --quiet && dpkg -i puppet.deb && rm puppet.deb && apt-get update -q", env: {"DEBIAN_FRONTEND" => "noninteractive"}
-                
-            # install puppet agent
-            node.vm.provision :shell, name: "install puppet agent", inline: "apt-get install puppet-agent facter -o Dpkg::Options::=\"--force-confold\" -q -y", env: {"DEBIAN_FRONTEND" => "noninteractive"}
-            node.vm.provision :shell, name: "enable puppet agent", inline: "puppet resource service puppet ensure=running enable=true"   
-            node.vm.provision :shell, name: "set puppet master connection", inline: "puppet config set server puppet-master.local --section main"
-            node.vm.provision :shell, name: "bootstrap puppet ssl", inline: "puppet ssl bootstrap" # nothing further is needed, as autosigning is enabled!
+            # enable salt repo
+            node.vm.provision :shell, name: "setup salt key",
+                inline: "curl -fsSL -o /etc/apt/keyrings/salt-archive-keyring-2023.gpg https://repo.saltproject.io/salt/py3/ubuntu/22.04/amd64/SALT-PROJECT-GPG-PUBKEY-2023.gpg \
+                && echo \"deb [signed-by=/etc/apt/keyrings/salt-archive-keyring-2023.gpg arch=amd64] https://repo.saltproject.io/salt/py3/ubuntu/22.04/amd64/latest jammy main\" | sudo tee /etc/apt/sources.list.d/salt.list"
+            node.vm.provision :shell, name: "refresh package list", inline: "apt-get update"
+
+            # install salt packages
+            node.vm.provision :shell, name: "install salt packages", inline: "apt-get install salt-minion -o Dpkg::Options::=\"--force-confold\" -q -y"
+            
+            # set local params
+            node.vm.provision :shell, name: "set local salt config", inline: "echo \'id: node-#{i}\ngrains:\n  nodeid: node-#{i}\' > /etc/salt/local-minion.conf"
+            node.vm.provision :shell, name: "append to default config for debugging", inline: "echo \'\nlog_level: debug\n\' >> /etc/salt/minion"
+
+            # start salt
+            node.vm.provision :shell, name: "start salt components", inline: "systemctl enable salt-minion", reboot: true
         end
     end
 end
