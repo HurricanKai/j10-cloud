@@ -7,7 +7,7 @@ alcali:
     init_delay: null  # Gunicorn may take some delay to pop, adjust here
   deploy:
     repository: https://github.com/latenighttales/alcali.git
-    rev: v3006.3.0
+    rev: v3006.3.0 # synced the auth module too
     force_reset: False
     user: alcali
     group: alcali
@@ -23,11 +23,11 @@ alcali:
     allowed_hosts: '*'
     db_backend: postgresql
     db_name: salt
-    db_user: alcali
-    db_pass: d8df45aed3541fd9a062210ca4844a5b
+    db_user: salt
+    db_pass: e8b61efb5667ef953b704fce877bbe3f
     db_host: 127.0.0.1
     db_port: 5432
     master_minion_id: salt-master
-    secret_key: 'd8df45aed3541fd9a062210ca4844a5b'
+    secret_key: 'd8df45aed359713569uhg9a062210ca4844a5b'
     salt_url: 'https://127.0.0.1:8080'
-    salt_auth: rest
+    salt_auth: alcali

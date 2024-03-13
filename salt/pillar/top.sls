@@ -3,5 +3,4 @@
 ---
 base:
   "salt-master":
-    - salt-master-postgres
     - salt-master-alcali

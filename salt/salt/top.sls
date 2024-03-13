@@ -3,4 +3,4 @@
 ---
 base:
   "salt-master":
-    - alcali-with-db
+    - alcali

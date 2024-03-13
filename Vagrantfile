@@ -22,7 +22,7 @@ Vagrant.configure("2") do |config|
 
     config.vm.define "salt-master" do |node|
         node.vm.network "private_network", ip: "192.168.57.2"
-        node.vm.network "forwarded_port", guest: 8000, host: 8123
+        node.vm.network "forwarded_port", guest: 8000, host: 8124
         node.vm.synced_folder "salt/master-confs/", "/etc/salt/master.d/"
         node.vm.synced_folder "salt/minion-confs/", "/etc/salt/minion.d/"
         node.vm.synced_folder "salt/pillar/", "/srv/pillar/"
@@ -46,12 +46,13 @@ Vagrant.configure("2") do |config|
         node.vm.provision :shell, name: "setup salt key",
             inline: "curl -fsSL -o /etc/apt/keyrings/salt-archive-keyring-2023.gpg https://repo.saltproject.io/salt/py3/ubuntu/22.04/amd64/SALT-PROJECT-GPG-PUBKEY-2023.gpg \
             && echo \"deb [signed-by=/etc/apt/keyrings/salt-archive-keyring-2023.gpg arch=amd64] https://repo.saltproject.io/salt/py3/ubuntu/22.04/amd64/latest jammy main\" | sudo tee /etc/apt/sources.list.d/salt.list"
+        node.vm.provision :shell, name: "install postgres repo", inline: "echo \"deb http://apt.postgresql.org/pub/repos/apt jammy-pgdg main\" > /etc/apt/sources.list.d/pgdg.list"
+        node.vm.provision :shell, name: "install postgres signing key", inline: "curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg"
         node.vm.provision :shell, name: "refresh package list", inline: "apt-get update"
 
         # install salt packages
-        node.vm.provision :shell, name: "install salt packages", inline: "apt-get install salt-minion salt-master salt-ssh salt-syndic salt-cloud salt-api python3-pip libgit2-dev patchelf pkg-config -o Dpkg::Options::=\"--force-confold\" -q -y"
+        node.vm.provision :shell, name: "install salt packages", inline: "apt-get install salt-minion salt-master salt-ssh salt-syndic salt-cloud salt-api python3-pip libgit2-dev patchelf pkg-config python3-psycopg2 -o Dpkg::Options::=\"--force-confold\" -q -y"
         node.vm.provision :shell, name: "install pygit2 for gitfs", inline: "/opt/saltstack/salt/salt-pip install pygit2 --no-deps --only-binary=:all:"
-
 
         node.vm.provision :shell, name: "append to default config", inline: "echo \'\nlog_level: debug\n\' >> /etc/salt/master"
 
@@ -70,7 +71,81 @@ Vagrant.configure("2") do |config|
         node.vm.provision :shell, name: "install cherrypy", inline: "pip install cherrypy"
         node.vm.provision :shell, name: "generate self-signed certs", inline: "salt-call --local tls.create_self_signed_cert cacert_path='/etc/pki'"
         node.vm.provision :shell, name: "set cert permissions", inline: "chown -R salt:salt /etc/pki/tls"
-        
+        node.vm.provision :shell, name: "get alcali module", inline: "mkdir -p /srv/salt/auth/ && curl -o /srv/salt/auth/alcali.py https://raw.githubusercontent.com/latenighttales/alcali/v3006.3.0/docker/saltconfig/salt/auth/alcali.py"
+
+
+        # install and setup postgres16, used as a returner for salt minions
+        node.vm.provision :shell, name: "install postgres16", inline: "apt-get install postgresql-16 postgresql-contrib-16 -o Dpkg::Options::=\"--force-confold\" -q -y"
+        node.vm.provision :shell, name: "install psycopg2", inline: "/opt/saltstack/salt/salt-pip install psycopg2-binary"
+        node.vm.provision :shell, name: "global access psql", inline: "echo \"listen_addresses = '127.0.0.1,192.168.57.2'\" >> /etc/postgresql/16/main/postgresql.conf"
+        node.vm.provision :shell, name: "setup acls", inline: "echo \"local all postgres ident\nhost salt alcali 127.0.0.1/32 md5\nhost salt salt 127.0.0.1/32 md5\nhost salt salt 192.168.57.0/24 md5\n\" > /etc/postgresql/16/main/pg_hba.conf"
+        node.vm.provision :shell, name: "start postgresql", inline: "systemctl enable --now postgresql"
+        node.vm.provision :shell, name: "create roles and database", inline: <<-'SCRIPT'
+sudo -u postgres psql << EOF
+CREATE ROLE salt WITH PASSWORD 'e8b61efb5667ef953b704fce877bbe3f' LOGIN;
+CREATE DATABASE salt WITH OWNER salt;
+
+-- TODO Better privileges
+EOF
+SCRIPT
+        node.vm.provision :shell, name: "create roles and database", inline: <<-'SCRIPT'
+env PGPASSWORD="e8b61efb5667ef953b704fce877bbe3f" psql -h 127.0.0.1 -U salt -d salt << EOF
+--
+-- Table structure for table 'jids'
+--
+
+DROP TABLE IF EXISTS jids;
+CREATE TABLE jids (
+  jid   varchar(20) PRIMARY KEY,
+  load  text NOT NULL
+);
+
+--
+-- Table structure for table 'salt_returns'
+--
+
+DROP TABLE IF EXISTS salt_returns;
+CREATE TABLE salt_returns (
+  fun       varchar(50) NOT NULL,
+  jid       varchar(255) NOT NULL,
+  return    text NOT NULL,
+  full_ret  text,
+  id        varchar(255) NOT NULL,
+  success   varchar(10) NOT NULL,
+  alter_time   TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE INDEX idx_salt_returns_id ON salt_returns (id);
+CREATE INDEX idx_salt_returns_jid ON salt_returns (jid);
+CREATE INDEX idx_salt_returns_fun ON salt_returns (fun);
+CREATE INDEX idx_salt_returns_updated ON salt_returns (alter_time);
+
+--
+-- Table structure for table salt_events
+--
+
+DROP TABLE IF EXISTS salt_events;
+DROP SEQUENCE IF EXISTS seq_salt_events_id;
+CREATE SEQUENCE seq_salt_events_id;
+CREATE TABLE salt_events (
+    id BIGINT NOT NULL UNIQUE DEFAULT nextval('seq_salt_events_id'),
+    tag varchar(255) NOT NULL,
+    data text NOT NULL,
+    alter_time TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    master_id varchar(255) NOT NULL
+);
+
+CREATE INDEX idx_salt_events_tag on salt_events (tag);
+
+-- TODO: Fix privileges of alcali
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO alcali;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO salt;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO alcali;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO salt;
+
+EOF
+SCRIPT
+ 
         # start salt
         node.vm.provision :shell, name: "start salt components", inline: "systemctl enable salt-master && systemctl enable salt-syndic && systemctl enable salt-api && systemctl enable salt-minion", reboot: true
 
@@ -105,7 +180,8 @@ Vagrant.configure("2") do |config|
             node.vm.provision :shell, name: "set local salt config", inline: "echo \'id: node-#{i}\ngrains:\n  nodeid: node-#{i}\' > /etc/salt/local-minion.conf"
             node.vm.provision :shell, name: "append to default config", inline: "echo \'\nlog_level: debug\ninclude: minion.d/*.conf\n\' >> /etc/salt/minion"
             # install salt packages
-            node.vm.provision :shell, name: "install salt packages", inline: "apt-get install salt-minion -o Dpkg::Options::=\"--force-confold\" -q -y"
+            node.vm.provision :shell, name: "install salt packages", inline: "apt-get install salt-minion salt-master salt-ssh salt-syndic salt-cloud salt-api python3-pip libgit2-dev patchelf pkg-config python3-psycopg2 -o Dpkg::Options::=\"--force-confold\" -q -y"
+            node.vm.provision :shell, name: "install psycopg2", inline: "/opt/saltstack/salt/salt-pip install psycopg2-binary"
 
             # start salt
             node.vm.provision :shell, name: "start salt components", inline: "systemctl enable salt-minion", reboot: true
