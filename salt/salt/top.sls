@@ -4,3 +4,5 @@
 base:
   "salt-master":
     - alcali
+  "*":
+    - default
